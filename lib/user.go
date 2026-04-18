@@ -11,8 +11,8 @@ import (
 
 type User struct {
 	UserPermissions `mapstructure:",squash"`
-	Username        string
-	Password        string
+	Username        string `json:"username"`
+	Password        string `json:"password,omitempty"`
 }
 
 func (u User) checkPassword(input string) bool {

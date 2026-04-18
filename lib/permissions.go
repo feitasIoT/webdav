@@ -1,6 +1,8 @@
 package lib
 
 import (
+	"encoding"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -12,6 +14,47 @@ type Rule struct {
 	Permissions Permissions
 	Path        string
 	Regex       *regexp.Regexp
+}
+
+func (r *Rule) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Permissions Permissions `json:"permissions"`
+		Path        string      `json:"path,omitempty"`
+		Regex       string      `json:"regex,omitempty"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	r.Permissions = aux.Permissions
+	r.Path = aux.Path
+	if aux.Regex != "" {
+		re, err := regexp.Compile(aux.Regex)
+		if err != nil {
+			return err
+		}
+		r.Regex = re
+	} else {
+		r.Regex = nil
+	}
+
+	return nil
+}
+
+func (r Rule) MarshalJSON() ([]byte, error) {
+	var aux struct {
+		Permissions Permissions `json:"permissions"`
+		Path        string      `json:"path,omitempty"`
+		Regex       string      `json:"regex,omitempty"`
+	}
+
+	aux.Permissions = r.Permissions
+	aux.Path = r.Path
+	if r.Regex != nil {
+		aux.Regex = r.Regex.String()
+	}
+
+	return json.Marshal(aux)
 }
 
 func (r *Rule) Validate() error {
@@ -43,10 +86,10 @@ const (
 )
 
 type UserPermissions struct {
-	Directory     string
-	Permissions   Permissions
-	Rules         []*Rule
-	RulesBehavior RulesBehavior
+	Directory     string        `json:"directory"`
+	Permissions   Permissions   `json:"permissions"`
+	Rules         []*Rule       `json:"rules,omitempty"`
+	RulesBehavior RulesBehavior `json:"rulesBehavior"`
 }
 
 // Allowed checks if the user has permission to access a directory/file
@@ -117,6 +160,8 @@ type Permissions struct {
 	Delete bool
 }
 
+var _ encoding.TextMarshaler = Permissions{}
+
 func (p *Permissions) UnmarshalText(data []byte) error {
 	text := strings.ToLower(string(data))
 	if text == "none" {
@@ -139,6 +184,30 @@ func (p *Permissions) UnmarshalText(data []byte) error {
 	}
 
 	return nil
+}
+
+func (p Permissions) MarshalText() ([]byte, error) {
+	switch {
+	case !p.Create && !p.Read && !p.Update && !p.Delete:
+		return []byte("none"), nil
+	case p.Create && p.Read && p.Update && p.Delete:
+		return []byte("CRUD"), nil
+	}
+
+	out := make([]byte, 0, 4)
+	if p.Create {
+		out = append(out, 'C')
+	}
+	if p.Read {
+		out = append(out, 'R')
+	}
+	if p.Update {
+		out = append(out, 'U')
+	}
+	if p.Delete {
+		out = append(out, 'D')
+	}
+	return out, nil
 }
 
 // Allowed returns whether this permission set has permissions to execute this

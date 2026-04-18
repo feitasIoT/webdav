@@ -38,6 +38,8 @@ type Config struct {
 	Log             Log
 	CORS            CORS
 	Users           []User
+	Redis           Redis
+	Management      Management
 }
 
 func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
@@ -83,6 +85,15 @@ func ParseConfig(filename string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetDefault("Debug", false)
 	v.SetDefault("NoSniff", false)
 	v.SetDefault("NoPassword", false)
+	v.SetDefault("Redis.Enabled", false)
+	v.SetDefault("Redis.Addr", "127.0.0.1:6379")
+	v.SetDefault("Redis.DB", 0)
+	v.SetDefault("Redis.KeyPrefix", "webdav:")
+	v.SetDefault("Redis.SeedFromConfig", true)
+	v.SetDefault("Management.Enabled", false)
+	v.SetDefault("Management.Prefix", "/api")
+	v.SetDefault("Management.OpenAPIPath", "/openapi.json")
+	v.SetDefault("Management.DocsPath", "/docs")
 	v.SetDefault("Log.Format", "console")
 	v.SetDefault("Log.Outputs", []string{"stderr"})
 	v.SetDefault("Log.Colors", true)
@@ -185,6 +196,33 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Redis.Enabled {
+		if strings.TrimSpace(c.Redis.Addr) == "" {
+			return errors.New("invalid config: Redis.Addr must be defined if Redis is enabled")
+		}
+		if strings.TrimSpace(c.Redis.KeyPrefix) == "" {
+			return errors.New("invalid config: Redis.KeyPrefix must be defined if Redis is enabled")
+		}
+	}
+
+	if c.Management.Enabled {
+		if strings.TrimSpace(c.Management.Prefix) == "" {
+			return errors.New("invalid config: Management.Prefix must be defined if management is enabled")
+		}
+		if !strings.HasPrefix(c.Management.Prefix, "/") {
+			return errors.New("invalid config: Management.Prefix must start with '/'")
+		}
+		if strings.TrimSpace(c.Management.Token) == "" {
+			return errors.New("invalid config: Management.Token must be defined if management is enabled")
+		}
+		if strings.TrimSpace(c.Management.OpenAPIPath) == "" || !strings.HasPrefix(c.Management.OpenAPIPath, "/") {
+			return errors.New("invalid config: Management.OpenAPIPath must start with '/'")
+		}
+		if strings.TrimSpace(c.Management.DocsPath) == "" || !strings.HasPrefix(c.Management.DocsPath, "/") {
+			return errors.New("invalid config: Management.DocsPath must start with '/'")
+		}
+	}
+
 	return nil
 }
 
@@ -216,4 +254,22 @@ type CORS struct {
 	AllowedHosts   []string `mapstructure:"allowed_hosts"`
 	AllowedMethods []string `mapstructure:"allowed_methods"`
 	ExposedHeaders []string `mapstructure:"exposed_headers"`
+}
+
+type Redis struct {
+	Enabled        bool
+	Addr           string
+	Username       string
+	Password       string
+	DB             int
+	KeyPrefix      string `mapstructure:"key_prefix"`
+	SeedFromConfig bool   `mapstructure:"seed_from_config"`
+}
+
+type Management struct {
+	Enabled     bool
+	Prefix      string
+	Token       string
+	OpenAPIPath string `mapstructure:"openapi_path"`
+	DocsPath    string `mapstructure:"docs_path"`
 }

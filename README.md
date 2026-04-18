@@ -203,7 +203,38 @@ users:
 # the username using basic authentication, and then disable webdav's password
 # check using the option:
 # noPassword: true
+
+# Optional: store users and global permissions in Redis instead of the config file.
+redis:
+  enabled: false
+  addr: 127.0.0.1:6379
+  username: ""
+  password: ""
+  db: 0
+  key_prefix: "webdav:"
+  # When enabled, seeds Redis from the config file only if keys are missing.
+  seed_from_config: true
+
+# Optional: management API (OpenAPI + endpoints to manage users/global directory/permissions).
+# NOTE: protect the token. Anyone with it can manage users.
+management:
+  enabled: false
+  prefix: /api
+  openapi_path: /openapi.json
+  docs_path: /docs
+  token: "change-me"
 ```
+
+### Management API
+
+When `management.enabled` is `true`, the server exposes a small JSON API under `management.prefix`:
+
+- OpenAPI JSON: `GET {prefix}{openapi_path}` (no auth)
+- Swagger UI: `GET {prefix}{docs_path}` (no auth)
+- Health: `GET {prefix}/health` (requires `Authorization: Bearer <token>`)
+- Global permissions: `GET/PUT/PATCH {prefix}/global` (requires token)
+- Users: `GET/POST {prefix}/users` (requires token)
+- User by name: `GET/PUT/PATCH/DELETE {prefix}/users/{username}` (requires token)
 
 ### CORS
 

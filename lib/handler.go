@@ -1,25 +1,25 @@
 package lib
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/rs/cors"
 	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
 
-type handlerUser struct {
-	User
-	webdav.Handler
-}
-
 type Handler struct {
+	cfg         *Config
+	store       Store
+	ls          webdav.LockSystem
+	logFunc     func(*http.Request, error)
 	noPassword  bool
 	behindProxy bool
-	user        *handlerUser
-	users       map[string]*handlerUser
+	management  http.Handler
 }
 
 func NewHandler(c *Config) (http.Handler, error) {
@@ -30,45 +30,44 @@ func NewHandler(c *Config) (http.Handler, error) {
 		lZap.Debug("handle webdav request", zap.String("method", r.Method), zap.String("path", r.URL.Path), zap.Error(err))
 	}
 
-	h := &Handler{
-		noPassword:  c.NoPassword,
-		behindProxy: c.BehindProxy,
-		user: &handlerUser{
-			User: User{
-				UserPermissions: c.UserPermissions,
-			},
-			Handler: webdav.Handler{
-				Prefix: c.Prefix,
-				FileSystem: Dir{
-					Dir:     webdav.Dir(c.Directory),
-					noSniff: c.NoSniff,
-				},
-				LockSystem: &lockSystem{
-					LockSystem: ls,
-					directory:  c.Directory,
-				},
-				Logger: logFunc,
-			},
-		},
-		users: map[string]*handlerUser{},
+	var store Store
+	if c.Redis.Enabled {
+		s, err := NewRedisStore(c.Redis)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		if c.Redis.SeedFromConfig {
+			if err := seedStoreFromConfigIfEmpty(ctx, s, c); err != nil {
+				return nil, err
+			}
+		}
+
+		if _, err := s.GetGlobal(ctx); err != nil && err != ErrNotFound {
+			return nil, err
+		}
+		if _, err := s.ListUsers(ctx); err != nil {
+			return nil, err
+		}
+
+		store = s
+	} else {
+		store = NewStoreFromConfig(c)
 	}
 
-	for _, u := range c.Users {
-		h.users[u.Username] = &handlerUser{
-			User: u,
-			Handler: webdav.Handler{
-				Prefix: c.Prefix,
-				FileSystem: Dir{
-					Dir:     webdav.Dir(u.Directory),
-					noSniff: c.NoSniff,
-				},
-				LockSystem: &lockSystem{
-					LockSystem: ls,
-					directory:  u.Directory,
-				},
-				Logger: logFunc,
-			},
-		}
+	h := &Handler{
+		cfg:         c,
+		store:       store,
+		ls:          ls,
+		logFunc:     logFunc,
+		noPassword:  c.NoPassword,
+		behindProxy: c.BehindProxy,
+	}
+
+	if c.Management.Enabled {
+		h.management = NewManagementHandler(c, store)
 	}
 
 	if c.CORS.Enabled {
@@ -82,8 +81,19 @@ func NewHandler(c *Config) (http.Handler, error) {
 		}).Handler(h), nil
 	}
 
-	if len(c.Users) == 0 {
+	if !c.Redis.Enabled && len(c.Users) == 0 {
 		zap.L().Warn("unprotected config: no users have been set, so no authentication will be used")
+	}
+	if c.Redis.Enabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		users, err := store.ListUsers(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(users) == 0 {
+			zap.L().Warn("unprotected config: no users have been set in redis, so no authentication will be used")
+		}
 	}
 
 	if c.NoPassword {
@@ -95,42 +105,84 @@ func NewHandler(c *Config) (http.Handler, error) {
 
 // ServeHTTP determines if the request is for this plugin, and if all prerequisites are met.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	user := h.user
-
 	lZap := getRequestLogger(r, h.behindProxy)
 
+	if h.cfg.Management.Enabled && strings.HasPrefix(r.URL.Path, h.cfg.Management.Prefix) {
+		h.management.ServeHTTP(w, r)
+		return
+	}
+
+	global, err := h.store.GetGlobal(r.Context())
+	if err != nil && err != ErrNotFound {
+		lZap.Error("failed to load global permissions", zap.Error(err))
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if err == ErrNotFound {
+		global = h.cfg.UserPermissions
+	}
+
+	userPerms := global
+	directory := global.Directory
+	username := ""
+
 	// Authentication
-	if len(h.users) > 0 {
+	users, err := h.store.ListUsers(r.Context())
+	if err != nil {
+		lZap.Error("failed to list users", zap.Error(err))
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if len(users) > 0 {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 
 		// Gets the correct user for this request.
-		username, password, ok := r.BasicAuth()
+		var password string
+		var ok bool
+		username, password, ok = r.BasicAuth()
 		if !ok {
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
 			return
 		}
 
-		user, ok = h.users[username]
-		if !ok {
+		u, err := h.store.GetUser(r.Context(), username)
+		if err != nil {
 			// Log invalid username
 			lZap.Info("invalid username", zap.String("username", username))
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
 			return
 		}
 
-		if !h.noPassword && !user.checkPassword(password) {
+		if !h.noPassword && !u.checkPassword(password) {
 			// Log invalid password
 			lZap.Info("invalid password", zap.String("username", username))
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
 			return
 		}
 
+		userPerms = u.UserPermissions
+		directory = u.Directory
+
 		// Log successful authorization
 		lZap.Info("user authorized", zap.String("username", username))
 	}
 
+	webdavHandler := webdav.Handler{
+		Prefix: h.cfg.Prefix,
+		FileSystem: Dir{
+			Dir:     webdav.Dir(directory),
+			noSniff: h.cfg.NoSniff,
+		},
+		LockSystem: &lockSystem{
+			LockSystem: h.ls,
+			directory:  directory,
+		},
+		Logger: h.logFunc,
+	}
+
 	// Convert the HTTP request into an internal request type
-	req, err := newRequest(r, h.user.Prefix)
+	req, err := newRequest(r, h.cfg.Prefix)
 	if err != nil {
 		lZap.Info("invalid request path or destination", zap.Error(err))
 		http.Error(w, "Invalid request path or destination", http.StatusBadRequest)
@@ -138,12 +190,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Checks for user permissions relatively to this PATH.
-	allowed := user.Allowed(req, func(filename string) bool {
-		_, err := user.FileSystem.Stat(r.Context(), filename)
+	allowed := userPerms.Allowed(req, func(filename string) bool {
+		_, err := webdavHandler.FileSystem.Stat(r.Context(), filename)
 		return !os.IsNotExist(err)
 	})
 
-	lZap.Debug("allowed & method & path", zap.Bool("allowed", allowed), zap.String("method", r.Method), zap.String("path", r.URL.Path))
+	lZap.Debug("allowed & method & path", zap.Bool("allowed", allowed), zap.String("method", r.Method), zap.String("path", r.URL.Path), zap.String("username", username))
 
 	if !allowed {
 		w.WriteHeader(http.StatusForbidden)
@@ -165,8 +217,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 		collection resources.
 	//
 	// GET (or HEAD), when applied to collection, will return the same as PROPFIND method.
-	if (r.Method == "GET" || r.Method == "HEAD") && strings.HasPrefix(r.URL.Path, user.Prefix) {
-		info, err := user.FileSystem.Stat(r.Context(), strings.TrimPrefix(r.URL.Path, user.Prefix))
+	if (r.Method == "GET" || r.Method == "HEAD") && strings.HasPrefix(r.URL.Path, webdavHandler.Prefix) {
+		info, err := webdavHandler.FileSystem.Stat(r.Context(), strings.TrimPrefix(r.URL.Path, webdavHandler.Prefix))
 		if err == nil && info.IsDir() {
 			r.Method = "PROPFIND"
 
@@ -177,7 +229,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Runs the WebDAV.
-	user.ServeHTTP(w, r)
+	webdavHandler.ServeHTTP(w, r)
 }
 
 // getRequestLogger creates a zap.Logger using the request remote ip.
